@@ -4,11 +4,11 @@ Param(
     [string]$AWSRegion,
     [string]$Domain,
     [string]$DomainOwner,
-    [string]$EnableDebug
+    [string]$EnableDebug = "no" # Valor por defecto
 )
-
+ 
 ###############################################################################
-# 1) Si las variables no vienen por parámetro, pedirlas al usuario
+# 1) Validar entradas y pedir datos faltantes
 ###############################################################################
 if (-not $AWSAccessKey) {
     $AWSAccessKey = Read-Host "Ingrese su AWS Access Key ID"
@@ -25,67 +25,62 @@ if (-not $Domain) {
 if (-not $DomainOwner) {
     $DomainOwner = Read-Host "Ingrese el ID de la cuenta AWS (Domain Owner)"
 }
-if (-not $EnableDebug) {
-    $EnableDebug = Read-Host "¿Habilitar modo debug? (yes/no)"
-}
-
+ 
+# Validar que no queden variables vacías
 if (-not $AWSRegion) {
-    Write-Error "La región de AWS es obligatoria. Ejemplo: us-east-1"
+    Write-Error "La región de AWS es obligatoria (ejemplo: us-east-1)."
     exit 1
 }
-
+ 
 ###############################################################################
-# 2) Definir carpeta y archivo donde guardaremos las credenciales
+# 2) Definir carpeta y archivo de credenciales personalizado
 ###############################################################################
 $SharedCredentialsFolder = "D:\MisCredenciales"
 $SharedCredentialsFile   = Join-Path $SharedCredentialsFolder "credentials"
-
-# Creamos la carpeta si no existe
+ 
+# Crear carpeta si no existe
 if (-not (Test-Path $SharedCredentialsFolder)) {
     Write-Host "Creando carpeta para credenciales en $SharedCredentialsFolder..."
     New-Item -ItemType Directory -Path $SharedCredentialsFolder | Out-Null
 }
-
-###############################################################################
-# 3) Establecer la variable de entorno para que AWS CLI use este archivo
-###############################################################################
+ 
+# Establecer la variable de entorno para que AWS CLI use este archivo
 $Env:AWS_SHARED_CREDENTIALS_FILE = $SharedCredentialsFile
-
-Write-Host "Usando archivo de credenciales personalizado en: $SharedCredentialsFile"
-Write-Host "Variable de entorno AWS_SHARED_CREDENTIALS_FILE = $Env:AWS_SHARED_CREDENTIALS_FILE"
-
+Write-Host "`nUsando archivo de credenciales personalizado en: $SharedCredentialsFile"
+Write-Host "AWS_SHARED_CREDENTIALS_FILE = $Env:AWS_SHARED_CREDENTIALS_FILE"
+ 
 ###############################################################################
-# 4) Crear/Configurar el perfil "temp-profile" usando 'aws configure set'
+# 3) Configurar el perfil "temp-profile" en AWS CLI
 ###############################################################################
 $ProfileName = "temp-profile"
-
-Write-Host "`nConfigurando el perfil '$ProfileName' en AWS CLI..."
-aws configure set aws_access_key_id     $AWSAccessKey     --profile $ProfileName
-aws configure set aws_secret_access_key $AWSSecretKey     --profile $ProfileName
-aws configure set region                $AWSRegion        --profile $ProfileName
-
-###############################################################################
-# 5) Validar credenciales con sts get-caller-identity
-###############################################################################
-Write-Host "`nVerificando credenciales con sts get-caller-identity..."
+Write-Host "`n==> Configurando perfil '$ProfileName'..."
 try {
-    $CallerIdentity = aws sts get-caller-identity --profile $ProfileName --output json | ConvertFrom-Json
-    Write-Host "Credenciales válidas. Detalles:" -ForegroundColor Green
-    Write-Host " - Cuenta: $($CallerIdentity.Account)" -ForegroundColor Green
-    Write-Host " - Usuario ARN: $($CallerIdentity.Arn)" -ForegroundColor Green
+    aws configure set aws_access_key_id     $AWSAccessKey     --profile $ProfileName
+    aws configure set aws_secret_access_key $AWSSecretKey     --profile $ProfileName
+    aws configure set region                $AWSRegion        --profile $ProfileName
 } catch {
-    Write-Error "Error: Las credenciales son inválidas o hay un problema de firma. Revisa Access Key, Secret Key y Región."
+    Write-Error "Error al configurar el perfil '$ProfileName': $_"
     exit 1
 }
-
+ 
 ###############################################################################
-# 6) Obtener token de CodeArtifact
+# 4) Validar credenciales
 ###############################################################################
-Write-Host "`nObteniendo el token de AWS CodeArtifact para el dominio '$Domain'..."
-if ($EnableDebug -eq "yes") {
-    Write-Host "DEBUG: aws codeartifact get-authorization-token --profile $ProfileName --domain $Domain --domain-owner $DomainOwner --query authorizationToken --output text"
+Write-Host "`nVerificando credenciales con perfil '$ProfileName'..."
+try {
+    $CallerIdentity = aws sts get-caller-identity --profile $ProfileName --output json | ConvertFrom-Json
+    Write-Host "Credenciales válidas. Detalles:"
+    Write-Host " - Cuenta: $($CallerIdentity.Account)"
+    Write-Host " - Usuario ARN: $($CallerIdentity.Arn)"
+} catch {
+    Write-Error "Error: credenciales inválidas o problema de firma. Verifica Access Key, Secret Key y Región."
+    exit 1
 }
-
+ 
+###############################################################################
+# 5) Obtener token de CodeArtifact
+###############################################################################
+Write-Host "`nObteniendo token de CodeArtifact para el dominio '$Domain'..."
 try {
     $Token = aws codeartifact get-authorization-token `
         --profile $ProfileName `
@@ -93,15 +88,47 @@ try {
         --domain-owner $DomainOwner `
         --query authorizationToken `
         --output text
+    if (!$Token) {
+        throw "El token está vacío."
+    }
+    Write-Host "Token obtenido exitosamente."
 } catch {
-    Write-Error "Error al obtener el token de AWS CodeArtifact: $_"
+    Write-Error "Error al obtener el token de CodeArtifact: $_"
     exit 1
 }
-
-if (!$Token) {
-    Write-Error "No se pudo obtener el token de AWS CodeArtifact. El token está vacío."
+ 
+###############################################################################
+# 6) Configurar NuGet con el token
+###############################################################################
+Write-Host "`n==> Configurando la fuente de NuGet..."
+$NuGetSourceName = "$Domain/nuget-repo"
+$NuGetSourceUrl  = "https://$($Domain)-$($DomainOwner).d.codeartifact.$($AWSRegion).amazonaws.com/nuget/nuget-repo/v3/index.json"
+ 
+if ($EnableDebug -eq "yes") {
+    Write-Host "DEBUG: NuGetSourceName = $NuGetSourceName"
+    Write-Host "DEBUG: NuGetSourceUrl = $NuGetSourceUrl"
+}
+ 
+try {
+    # Eliminar fuente previa si existe
+    if (nuget sources list | Select-String -Pattern $NuGetSourceName) {
+        Write-Host "Eliminando fuente NuGet existente..."
+        nuget sources remove -Name $NuGetSourceName
+    }
+ 
+    # Agregar nueva fuente con token
+    nuget sources add -Name $NuGetSourceName `
+        -Source $NuGetSourceUrl `
+        -Username "aws" `
+        -Password $Token `
+        -StorePasswordInClearText
+    Write-Host "Fuente de NuGet '$NuGetSourceName' configurada correctamente."
+} catch {
+    Write-Error "Error al configurar la fuente de NuGet: $_"
     exit 1
 }
-
-Write-Host "`nToken obtenido exitosamente: $Token" -ForegroundColor Green
-Write-Host "`n¡Listo! Se configuró el perfil '$ProfileName' en el archivo '$SharedCredentialsFile' y obtuvimos el token de CodeArtifact."
+ 
+###############################################################################
+# FIN
+###############################################################################
+Write-Host "`n¡Listo! Configuración completada exitosamente." -ForegroundColor Cyan

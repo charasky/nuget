@@ -35,7 +35,7 @@ if (-not $AWSRegion) {
 ###############################################################################
 # 2) Definir carpeta y archivo de credenciales personalizado
 ###############################################################################
-$SharedCredentialsFolder = "D:\MisCredenciales"
+$SharedCredentialsFolder = "C:\MisCredenciales"
 $SharedCredentialsFile   = Join-Path $SharedCredentialsFolder "credentials"
  
 # Crear carpeta si no existe

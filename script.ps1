@@ -1,81 +1,88 @@
-# Solicitar credenciales de AWS al usuario
-$AWSAccessKey = Read-Host "Ingrese su AWS Access Key ID"
-$AWSSecretKey = Read-Host "Ingrese su AWS Secret Access Key" -AsSecureString
-$AWSRegion = Read-Host "Ingrese su región de AWS (por ejemplo, us-east-1)"
-$Domain = Read-Host "Ingrese el nombre del dominio CodeArtifact (por ejemplo, nuget-domain)"
-$DomainOwner = Read-Host "Ingrese el ID de la cuenta AWS (Domain Owner)"
+param()
 
-# Convertir la AWS Secret Key a texto para usarla como variable de entorno
-$PlainSecretKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($AWSSecretKey)
-)
+# 1) Solicitar credenciales y configuración al usuario
+$AWSAccessKey  = Read-Host "Ingrese su AWS Access Key ID"
+# ¡OJO! Esto pedirá la clave en texto plano:
+$AWSSecretKey  = Read-Host "Ingrese su AWS Secret Access Key (texto plano, se mostrará en pantalla)"
+$AWSRegion     = Read-Host "Ingrese su región de AWS (por ejemplo, us-east-1)"
+$Domain        = Read-Host "Ingrese el nombre del dominio CodeArtifact (por ejemplo, nuget-domain)"
+$DomainOwner   = Read-Host "Ingrese el ID de la cuenta AWS (Domain Owner)"
+$EnableDebug   = Read-Host "¿Habilitar modo debug? (yes/no)"
 
-# Configurar variables principales
-$NuGetSourceName = "$Domain/nuget-repo"
-$NuGetSourceUrl = "https://$Domain-$DomainOwner.d.codeartifact.$AWSRegion.amazonaws.com/nuget/nuget-repo/v3/index.json"
+# 2) Validar que la región exista
+if (-not $AWSRegion) {
+    Write-Error "La región de AWS es obligatoria. Ejemplo: us-east-1"
+    exit 1
+}
 
-# Configurar credenciales de AWS usando variables de entorno
-Write-Host "Configurando las credenciales de AWS..." -ForegroundColor Cyan
-$env:AWS_ACCESS_KEY_ID = $AWSAccessKey
-$env:AWS_SECRET_ACCESS_KEY = $PlainSecretKey
-$env:AWS_REGION = $AWSRegion
+# 3) Definir variables para el perfil
+$ProfileName = "temp-profile"
+$CredentialFilePath = "$HOME/.aws/credentials"
 
-# Obtener el token de CodeArtifact
+# 4) Crear la carpeta .aws si no existe
+if (-not (Test-Path "$HOME/.aws")) {
+    New-Item -ItemType Directory -Path "$HOME/.aws" | Out-Null
+}
+
+Write-Host "=== Eliminando el archivo de credenciales para empezar limpio ==="
+if (Test-Path $CredentialFilePath) {
+    Remove-Item $CredentialFilePath -Force
+}
+
+Write-Host "Configurando un perfil temporal en AWS CLI..." -ForegroundColor Cyan
+
+# 5) Crear contenido para el perfil
+$profileContent = @"
+[$ProfileName]
+aws_access_key_id = $AWSAccessKey
+aws_secret_access_key = $AWSSecretKey
+region = $AWSRegion
+"@
+
+# 6) Escribir el archivo con codificación controlada (UTF-8 sin BOM)
+Set-Content -LiteralPath $CredentialFilePath -Value $profileContent -Encoding utf8NoBOM
+
+Write-Host "DEBUG: Perfil temporal configurado -> $ProfileName" -ForegroundColor Yellow
+Write-Host "DEBUG: Archivo de configuración -> $CredentialFilePath" -ForegroundColor Yellow
+
+# 7) Mostrar el contenido del archivo final
+Write-Host "`nContenido del archivo de credenciales recién escrito:" -ForegroundColor DarkCyan
+Get-Content $CredentialFilePath | ForEach-Object { "  $_" }
+Write-Host "`n==================================="
+
+# 8) Verificar credenciales con sts get-caller-identity
+Write-Host "Verificando las credenciales configuradas en el perfil temporal..." -ForegroundColor Cyan
+try {
+    $CallerIdentity = aws sts get-caller-identity --profile $ProfileName --output json | ConvertFrom-Json
+    Write-Host "Credenciales válidas. Detalles:" -ForegroundColor Green
+    Write-Host " - Cuenta: $($CallerIdentity.Account)" -ForegroundColor Green
+    Write-Host " - Usuario ARN: $($CallerIdentity.Arn)" -ForegroundColor Green
+} catch {
+    Write-Error "Las credenciales configuradas son inválidas o hay un problema con la firma. Verifica la Access Key, Secret Key y Región."
+    exit 1
+}
+
+# 9) Obtener el token de CodeArtifact
 Write-Host "Obteniendo el token de AWS CodeArtifact..." -ForegroundColor Cyan
+if ($EnableDebug -eq "yes") {
+    Write-Host "DEBUG: aws codeartifact get-authorization-token --profile $ProfileName --domain $Domain --domain-owner $DomainOwner --query authorizationToken --output text"
+}
+
 try {
     $Token = aws codeartifact get-authorization-token `
+        --profile $ProfileName `
         --domain $Domain `
         --domain-owner $DomainOwner `
         --query authorizationToken `
         --output text
 } catch {
-    Write-Host "Error al obtener el token de CodeArtifact:" -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Yellow
+    Write-Error "Error al obtener el token de AWS CodeArtifact: $_"
     exit 1
 }
 
-# Validar el token
 if (!$Token) {
     Write-Error "No se pudo obtener el token de AWS CodeArtifact. El token está vacío."
     exit 1
 }
 
-Write-Host "Token obtenido exitosamente." -ForegroundColor Green
-
-# Verificar si la fuente de NuGet ya existe
-Write-Host "Verificando si la fuente de NuGet ya está configurada..." -ForegroundColor Cyan
-$ExistingSource = nuget sources list | Where-Object { $_ -match $NuGetSourceName }
-
-if ($ExistingSource) {
-    Write-Host "La fuente de NuGet ya está configurada. Actualizando el token..." -ForegroundColor Yellow
-    
-    # Actualizar la fuente con el nuevo token
-    try {
-        nuget sources update -Name $NuGetSourceName `
-            -Source $NuGetSourceUrl `
-            -Username "aws" `
-            -Password $Token `
-            -StorePasswordInClearText
-    } catch {
-        Write-Host "Error al actualizar la fuente de NuGet:" -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Yellow
-        exit 1
-    }
-} else {
-    Write-Host "La fuente de NuGet no está configurada. Agregándola ahora..." -ForegroundColor Cyan
-    
-    try {
-        # Agregar la nueva fuente con el token
-        nuget sources add -Name $NuGetSourceName `
-            -Source $NuGetSourceUrl `
-            -Username "aws" `
-            -Password $Token `
-            -StorePasswordInClearText
-    } catch {
-        Write-Host "Error al configurar la fuente de NuGet:" -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Yellow
-        exit 1
-    }
-}
-
-Write-Host "Fuente de NuGet configurada correctamente." -ForegroundColor Green
+Write-Host "Token obtenido exitosamente: $Token" -ForegroundColor Green
